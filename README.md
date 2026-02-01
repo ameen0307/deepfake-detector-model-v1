@@ -22,3 +22,9 @@ cd deepfake-detector-model-v1
 python -m venv hf_env
 source hf_env/bin/activate
 pip install -r requirements.txt
+```
+RUN THE APP
+```bash
+python -m streamlit run app.py
+```
+
