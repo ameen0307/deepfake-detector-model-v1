@@ -1,0 +1,36 @@
+# Virtual environment
+hf_env/
+venv/
+
+# Python cache
+__pycache__/
+*.pyc
+
+# OS files
+.DS_Store
+
+# Streamlit cache
+.streamlit/
+
+# Optional: model weights (recommended)
+model.safetensors
+pytorch_model.bin
+
+# Hugging Face cache (optional but safe)
+.cache/
+huggingface/
+**/.cache/
+
+# Torch / training artifacts
+*.pt
+*.bin
+*.safetensors
+checkpoint-*/
+runs/
+logs/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# VS Code
+.vscode/
