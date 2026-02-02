@@ -3,7 +3,8 @@ import torch
 from transformers import AutoImageProcessor, SiglipForImageClassification
 from PIL import Image
 
-# Page config
+MODEL_ID = "prithivMLmods/deepfake-detector-model-v1"
+
 st.set_page_config(
     page_title="Deepfake Detector",
     page_icon="🕵️",
@@ -11,17 +12,16 @@ st.set_page_config(
 )
 
 st.title("🕵️ Deepfake Image Detector")
-st.write("Upload an image and check whether it is **REAL** or **FAKE**.")
+st.write("Upload an image and check whether it is **REAL**, **FAKE**, or **UNCERTAIN**.")
 
-# Load model once
 @st.cache_resource
 def load_model():
     processor = AutoImageProcessor.from_pretrained(
-        ".",
+        MODEL_ID,
         use_fast=False
     )
     model = SiglipForImageClassification.from_pretrained(
-        ".",
+        MODEL_ID,
         torch_dtype=torch.float32,
         low_cpu_mem_usage=True
     )
@@ -48,7 +48,6 @@ if uploaded_file:
 
         fake_prob = probs[0].item()
         real_prob = probs[1].item()
-
         confidence = max(fake_prob, real_prob)
 
         if confidence < 0.6:
