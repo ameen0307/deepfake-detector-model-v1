@@ -1,10 +1,9 @@
 import streamlit as st
 import torch
-import cv2
-import numpy as np
 import sqlite3
 import bcrypt
 import os
+import hashlib
 from datetime import datetime
 from PIL import Image
 from transformers import AutoImageProcessor, AutoModelForImageClassification
@@ -33,7 +32,7 @@ def init_db():
     CREATE TABLE IF NOT EXISTS history (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         username TEXT,
-        filepath TEXT,
+        filepath TEXT UNIQUE,
         prediction TEXT,
         confidence REAL,
         timestamp TEXT
@@ -65,9 +64,7 @@ def login_user(username, password):
     c.execute("SELECT password FROM users WHERE username=?", (username,))
     row = c.fetchone()
     conn.close()
-    if row and bcrypt.checkpw(password.encode(), row[0]):
-        return True
-    return False
+    return row and bcrypt.checkpw(password.encode(), row[0])
 
 # ================= MODEL =================
 @st.cache_resource
@@ -81,20 +78,22 @@ def load_model():
 
 processor, model = load_model()
 
-# ================= PREDICTION =================
-def classify_image(image):
+# ================= HELPERS =================
+def file_hash(data: bytes):
+    return hashlib.md5(data).hexdigest()
+
+def classify_image(image: Image.Image):
     inputs = processor(images=image, return_tensors="pt")
     with torch.no_grad():
         outputs = model(**inputs)
         probs = torch.softmax(outputs.logits, dim=1)[0]
 
-    fake_prob = probs[0].item()
-    real_prob = probs[1].item()
-    confidence = max(fake_prob, real_prob)
+    fake, real = probs[0].item(), probs[1].item()
+    confidence = max(fake, real)
 
     if confidence < 0.6:
         label = "UNCERTAIN"
-    elif fake_prob > real_prob:
+    elif fake > real:
         label = "FAKE"
     else:
         label = "REAL"
@@ -104,37 +103,79 @@ def classify_image(image):
 def save_history(username, filepath, prediction, confidence):
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    c.execute("""
-        INSERT INTO history VALUES (NULL, ?, ?, ?, ?, ?)
-    """, (
-        username,
-        filepath,
-        prediction,
-        confidence,
-        datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    ))
-    conn.commit()
-    conn.close()
+    try:
+        c.execute("""
+            INSERT INTO history VALUES (NULL, ?, ?, ?, ?, ?)
+        """, (
+            username,
+            filepath,
+            prediction,
+            confidence,
+            datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        ))
+        conn.commit()
+    except sqlite3.IntegrityError:
+        pass  # duplicate prevented
+    finally:
+        conn.close()
 
 def load_history(username):
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute("""
-        SELECT filepath, prediction, confidence, timestamp
+        SELECT id, filepath, prediction, confidence, timestamp
         FROM history
         WHERE username=?
-        ORDER BY id ASC
+        ORDER BY id DESC
     """, (username,))
     rows = c.fetchall()
     conn.close()
     return rows
 
-# ================= UI =================
-st.set_page_config("Deepfake Detector", "🕵️", layout="centered")
+def delete_history_item(history_id):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+
+    c.execute("SELECT filepath FROM history WHERE id=?", (history_id,))
+    row = c.fetchone()
+
+    if row:
+        filepath = row[0]
+        if os.path.exists(filepath):
+            os.remove(filepath)
+
+        c.execute("DELETE FROM history WHERE id=?", (history_id,))
+        conn.commit()
+
+    conn.close()
+
+def delete_all_history(username):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+
+    c.execute("SELECT filepath FROM history WHERE username=?", (username,))
+    rows = c.fetchall()
+
+    for (filepath,) in rows:
+        if os.path.exists(filepath):
+            os.remove(filepath)
+
+    c.execute("DELETE FROM history WHERE username=?", (username,))
+    conn.commit()
+    conn.close()
+
+
+# ================= SESSION =================
+st.set_page_config("Deepfake Detector", "🕵️", layout="wide")
 
 if "user" not in st.session_state:
     st.session_state.user = None
+if "selected_id" not in st.session_state:
+    st.session_state.selected_id = None
+if "processed_hashes" not in st.session_state:
+    st.session_state.processed_hashes = set()
 
+# ================= LOGIN =================
 if st.session_state.user is None:
     st.title("🔐 Login / Register")
 
@@ -166,48 +207,71 @@ username = st.session_state.user
 user_dir = os.path.join(UPLOAD_DIR, username)
 os.makedirs(user_dir, exist_ok=True)
 
-st.title("🕵️ Deepfake Detection Assistant")
-st.caption("Upload images. Scroll to see your full visual history.")
+# -------- SIDEBAR (HISTORY) --------
+st.sidebar.title("📁 History")
 
-# ---- CHAT HISTORY (GPT STYLE) ----
 history = load_history(username)
 
-for filepath, prediction, confidence, timestamp in history:
-    with st.chat_message("user"):
-        st.image(filepath, use_column_width=True)
+for hid, path, pred, conf, ts in history:
+    name = os.path.basename(path)
+    cols = st.sidebar.columns([4, 1])
 
-    with st.chat_message("assistant"):
-        if prediction == "REAL":
-            st.success("🟢 REAL")
-        elif prediction == "FAKE":
-            st.error("🔴 FAKE")
-        else:
-            st.warning("🟡 UNCERTAIN")
+    if cols[0].button(f"{name} · {ts.split()[0]}", key=f"select_{hid}"):
+        st.session_state.selected_id = hid
 
-        st.write(f"Confidence: **{confidence:.2%}**")
-        st.caption(timestamp)
+    if cols[1].button("🗑️", key=f"del_{hid}"):
+        delete_history_item(hid)
+        st.session_state.selected_id = None
+        st.rerun()
 
-# ---- UPLOAD (CHAT INPUT STYLE) ----
-uploaded_file = st.file_uploader(
-    "Upload an image",
-    type=["jpg", "jpeg", "png"]
-)
-
-if uploaded_file is not None and uploaded_file.name:
-    filename = f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uploaded_file.name}"
-    filepath = os.path.join(user_dir, filename)
-
-    with open(filepath, "wb") as f:
-        f.write(uploaded_file.read())
-
-    image = Image.open(filepath).convert("RGB")
-    label, confidence = classify_image(image)
-
-    save_history(username, filepath, label, confidence)
+st.sidebar.markdown("---")
+if st.sidebar.button("🗑️ Delete ALL history"):
+    delete_all_history(username)
+    st.session_state.selected_id = None
     st.rerun()
 
-# ---- LOGOUT ----
-st.markdown("---")
-if st.button("Logout"):
-    st.session_state.user = None
-    st.rerun()
+
+# -------- MAIN VIEW --------
+st.title("🕵️ Deepfake Detection Assistant")
+
+uploaded_file = st.file_uploader("Upload an image", ["jpg", "jpeg", "png"])
+
+if uploaded_file is not None:
+    data = uploaded_file.getvalue()
+    h = file_hash(data)
+
+    if h not in st.session_state.processed_hashes:
+        filename = f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uploaded_file.name}"
+        filepath = os.path.join(user_dir, filename)
+
+        with open(filepath, "wb") as f:
+            f.write(data)
+
+        image = Image.open(filepath).convert("RGB")
+        label, confidence = classify_image(image)
+
+        save_history(username, filepath, label, confidence)
+        st.session_state.processed_hashes.add(h)
+        st.session_state.selected_id = None
+
+        st.rerun()
+
+# -------- DISPLAY SELECTED ITEM --------
+if st.session_state.selected_id:
+    for hid, path, pred, conf, ts in history:
+        if hid == st.session_state.selected_id:
+            if os.path.exists(path):
+                st.image(path, use_column_width=True)
+            else:
+                st.warning("Image file not found")
+
+            if pred == "REAL":
+                st.success("🟢 REAL")
+            elif pred == "FAKE":
+                st.error("🔴 FAKE")
+            else:
+                st.warning("🟡 UNCERTAIN")
+
+            st.write(f"Confidence: **{conf:.2%}**")
+            st.caption(ts)
+            break
