@@ -8,6 +8,7 @@ import hashlib
 import numpy as np
 from datetime import datetime
 from PIL import Image
+import matplotlib.pyplot as plt
 from transformers import AutoImageProcessor, AutoModelForImageClassification
 
 # ================= CONFIG =================
@@ -71,10 +72,8 @@ def login_user(username, password):
 # ================= MODEL =================
 @st.cache_resource
 def load_model():
-    processor = AutoImageProcessor.from_pretrained(MODEL_ID, use_fast=False)
-    model = AutoModelForImageClassification.from_pretrained(
-        MODEL_ID, torch_dtype=torch.float32
-    )
+    processor = AutoImageProcessor.from_pretrained(MODEL_ID)
+    model = AutoModelForImageClassification.from_pretrained(MODEL_ID)
     model.eval()
     return processor, model
 
@@ -90,22 +89,30 @@ def classify_image(image: Image.Image):
         outputs = model(**inputs)
         probs = torch.softmax(outputs.logits, dim=1)[0]
 
-    fake, real = probs[0].item(), probs[1].item()
-    confidence = max(fake, real)
+    # Correct label mapping for this model
+    real_prob = probs[0].item()
+    fake_prob = probs[1].item()
+
+    confidence = max(real_prob, fake_prob)
 
     if confidence < 0.6:
         label = "UNCERTAIN"
-    elif fake > real:
+    elif fake_prob > real_prob:
         label = "FAKE"
     else:
         label = "REAL"
 
-    return label, confidence
+    return label, confidence, fake_prob
 
-def classify_video(video_path, frame_interval=30, max_frames=40):
+# ================= VIDEO LOGIC (FIXED) =================
+def classify_video(video_path, frame_interval=20, max_frames=40):
     cap = cv2.VideoCapture(video_path)
-    fake_scores, real_scores = [], []
-    frame_idx, used = 0, 0
+    fake_scores = []
+    real_scores = []
+    timeline = []
+
+    frame_idx = 0
+    used = 0
 
     while cap.isOpened() and used < max_frames:
         ret, frame = cap.read()
@@ -115,12 +122,14 @@ def classify_video(video_path, frame_interval=30, max_frames=40):
         if frame_idx % frame_interval == 0:
             frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             image = Image.fromarray(frame_rgb)
-            label, confidence = classify_image(image)
+            label, conf, fake_prob = classify_image(image)
+
+            timeline.append(fake_prob)
 
             if label == "FAKE":
-                fake_scores.append(confidence)
+                fake_scores.append(conf)
             elif label == "REAL":
-                real_scores.append(confidence)
+                real_scores.append(conf)
 
             used += 1
 
@@ -129,7 +138,7 @@ def classify_video(video_path, frame_interval=30, max_frames=40):
     cap.release()
 
     if not fake_scores and not real_scores:
-        return "UNCERTAIN", 0.0
+        return "UNCERTAIN", 0.0, []
 
     mean_fake = np.mean(fake_scores) if fake_scores else 0.0
     mean_real = np.mean(real_scores) if real_scores else 0.0
@@ -142,8 +151,9 @@ def classify_video(video_path, frame_interval=30, max_frames=40):
     else:
         label = "REAL"
 
-    return label, confidence
+    return label, confidence, timeline
 
+# ================= HISTORY =================
 def save_history(username, filepath, prediction, confidence):
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
@@ -205,9 +215,94 @@ def delete_all_history(username):
     conn.commit()
     conn.close()
 
-# ================= SESSION =================
+# ================= UI STYLING =================
 st.set_page_config("Deepfake Detector", "🕵️", layout="wide")
 
+st.markdown("""
+<style>
+* {
+    transition: background-color .2s ease,
+                color .2s ease,
+                box-shadow .18s ease,
+                transform .15s ease;
+}
+
+html[data-theme="light"] {
+    --card-bg: #ffffff;
+    --card-border: #e5e7eb;
+    --shadow-soft: rgba(15, 23, 42, 0.08);
+    --shadow-hard: rgba(15, 23, 42, 0.15);
+    --highlight: rgba(255,255,255,0.9);
+}
+
+html[data-theme="dark"] {
+    --card-bg: #0f172a;
+    --card-border: #1e293b;
+    --shadow-soft: rgba(0, 0, 0, 0.35);
+    --shadow-hard: rgba(0, 0, 0, 0.55);
+    --highlight: rgba(255,255,255,0.04);
+}
+
+.card {
+    background: linear-gradient(180deg,
+        var(--highlight),
+        var(--card-bg)
+    );
+    border-radius: 18px;
+    padding: 1.6rem;
+    border: 1px solid var(--card-border);
+    box-shadow:
+        0 2px 6px var(--shadow-soft),
+        0 10px 26px var(--shadow-hard);
+}
+
+.card:hover {
+    transform: translateY(-2px);
+    box-shadow:
+        0 6px 14px var(--shadow-soft),
+        0 18px 42px var(--shadow-hard);
+}
+
+button[kind="primary"], button[kind="secondary"] {
+    position: relative;
+    box-shadow:
+        inset 0 1px 0 rgba(255,255,255,.35),
+        0 2px 6px rgba(0,0,0,.18),
+        0 6px 18px rgba(0,0,0,.12);
+}
+
+button[kind="primary"]:hover,
+button[kind="secondary"]:hover {
+    transform: translateY(-1px);
+    box-shadow:
+        inset 0 1px 0 rgba(255,255,255,.45),
+        0 4px 10px rgba(0,0,0,.22),
+        0 10px 26px rgba(0,0,0,.18);
+}
+
+button[kind="primary"]:active,
+button[kind="secondary"]:active {
+    transform: translateY(1px);
+    box-shadow:
+        inset 0 2px 6px rgba(0,0,0,.25),
+        0 2px 4px rgba(0,0,0,.15);
+}
+
+section[data-testid="stSidebar"] button:hover {
+    transform: translateX(2px);
+}
+
+.fade-in {
+    animation: fadeIn .45s ease forwards;
+}
+@keyframes fadeIn {
+    from { opacity: 0; transform: translateY(6px); }
+    to { opacity: 1; transform: translateY(0); }
+}
+</style>
+""", unsafe_allow_html=True)
+
+# ================= SESSION =================
 if "user" not in st.session_state:
     st.session_state.user = None
 if "selected_id" not in st.session_state:
@@ -217,6 +312,7 @@ if "processed_hashes" not in st.session_state:
 
 # ================= LOGIN =================
 if st.session_state.user is None:
+    st.markdown("<div class='fade-in'>", unsafe_allow_html=True)
     st.title("🔐 Login / Register")
 
     tab1, tab2 = st.tabs(["Login", "Register"])
@@ -240,6 +336,7 @@ if st.session_state.user is None:
             else:
                 st.error("Username already exists")
 
+    st.markdown("</div>", unsafe_allow_html=True)
     st.stop()
 
 # ================= MAIN APP =================
@@ -255,13 +352,15 @@ for hid, path, pred, conf, ts in history:
     name = os.path.basename(path)
     cols = st.sidebar.columns([4, 1])
 
-    if cols[0].button(f"{name} · {ts.split()[0]}", key=f"select_{hid}"):
-        st.session_state.selected_id = hid
+    with cols[0]:
+        if st.button(f"{name} · {ts.split()[0]}", key=f"select_{hid}"):
+            st.session_state.selected_id = hid
 
-    if cols[1].button("🗑️", key=f"del_{hid}"):
-        delete_history_item(hid)
-        st.session_state.selected_id = None
-        st.rerun()
+    with cols[1]:
+        if st.button("🗑️", key=f"del_{hid}"):
+            delete_history_item(hid)
+            st.session_state.selected_id = None
+            st.rerun()
 
 st.sidebar.markdown("---")
 if st.sidebar.button("🗑️ Delete ALL history"):
@@ -269,14 +368,21 @@ if st.sidebar.button("🗑️ Delete ALL history"):
     st.session_state.selected_id = None
     st.rerun()
 
-# -------- UPLOAD --------
+# -------- HEADER --------
+st.markdown("<div class='fade-in'>", unsafe_allow_html=True)
 st.title("🕵️ Deepfake Detection Assistant")
+st.caption("AI-powered forensic analysis for images and videos")
+st.markdown("</div>", unsafe_allow_html=True)
 
+# -------- UPLOAD CARD --------
+st.markdown("<div class='card fade-in'>", unsafe_allow_html=True)
 uploaded_file = st.file_uploader(
-    "Upload image or video",
+    "📤 Upload image or video",
     ["jpg", "jpeg", "png", "mp4", "mov", "avi"]
 )
+st.markdown("</div>", unsafe_allow_html=True)
 
+# -------- PROCESS --------
 if uploaded_file:
     data = uploaded_file.getvalue()
     h = file_hash(data)
@@ -290,11 +396,12 @@ if uploaded_file:
 
         ext = uploaded_file.name.lower().split(".")[-1]
 
-        if ext in ["jpg", "jpeg", "png"]:
-            image = Image.open(filepath).convert("RGB")
-            label, confidence = classify_image(image)
-        else:
-            label, confidence = classify_video(filepath)
+        with st.spinner("🔍 Analyzing media..."):
+            if ext in ["jpg", "jpeg", "png"]:
+                image = Image.open(filepath).convert("RGB")
+                label, confidence, _ = classify_image(image)
+            else:
+                label, confidence, _ = classify_video(filepath)
 
         save_history(username, filepath, label, confidence)
         st.session_state.processed_hashes.add(h)
@@ -305,6 +412,8 @@ if uploaded_file:
 if st.session_state.selected_id:
     for hid, path, pred, conf, ts in history:
         if hid == st.session_state.selected_id:
+            st.markdown("<div class='card fade-in'>", unsafe_allow_html=True)
+
             if os.path.exists(path):
                 if path.lower().endswith((".mp4", ".mov", ".avi")):
                     st.video(path)
@@ -321,5 +430,19 @@ if st.session_state.selected_id:
                 st.warning("🟡 UNCERTAIN")
 
             st.write(f"Confidence: **{conf:.2%}**")
-            st.caption(ts)
+            st.caption(f"🕒 {ts}")
+
+            if path.lower().endswith((".mp4", ".mov", ".avi")):
+                _, _, timeline = classify_video(path)
+                if timeline:
+                    st.markdown("### 🎞 Frame-Level Fake Probability")
+                    fig = plt.figure()
+                    plt.plot(timeline)
+                    plt.ylim(0, 1)
+                    plt.xlabel("Sampled Frame")
+                    plt.ylabel("Fake Probability")
+                    plt.grid(alpha=0.3)
+                    st.pyplot(fig)
+
+            st.markdown("</div>", unsafe_allow_html=True)
             break
