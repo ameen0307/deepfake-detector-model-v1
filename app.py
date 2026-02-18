@@ -78,10 +78,8 @@ def login_user(username, password):
 # ================= MODEL =================
 @st.cache_resource
 def load_model():
-    processor = AutoImageProcessor.from_pretrained(MODEL_ID, use_fast=False)
-    model = AutoModelForImageClassification.from_pretrained(
-        MODEL_ID, torch_dtype=torch.float32
-    )
+    processor = AutoImageProcessor.from_pretrained(MODEL_ID)
+    model = AutoModelForImageClassification.from_pretrained(MODEL_ID)
     model.eval()
     return processor, model
 
@@ -125,12 +123,15 @@ def classify_image_tta(image: Image.Image):
     avg_logits = torch.stack(all_logits).mean(dim=0)
     probs = apply_temperature(avg_logits)[0]
 
-    fake, real = probs[0].item(), probs[1].item()
-    confidence = max(fake, real)
+    # Correct label mapping for this model
+    real_prob = probs[0].item()
+    fake_prob = probs[1].item()
+
+    confidence = max(real_prob, fake_prob)
 
     if confidence < UNCERTAINTY_THRESHOLD:
         label = "UNCERTAIN"
-    elif fake > real:
+    elif fake_prob > real_prob:
         label = "FAKE"
     else:
         label = "REAL"
@@ -262,7 +263,7 @@ def delete_all_history(username):
     conn.commit()
     conn.close()
 
-# ================= SESSION =================
+# ================= UI STYLING =================
 st.set_page_config("Deepfake Detector", "🕵️", layout="wide")
 
 for key, default in [
@@ -275,6 +276,7 @@ for key, default in [
 
 # ================= LOGIN =================
 if st.session_state.user is None:
+    st.markdown("<div class='fade-in'>", unsafe_allow_html=True)
     st.title("🔐 Login / Register")
     tab1, tab2 = st.tabs(["Login", "Register"])
 
@@ -297,6 +299,7 @@ if st.session_state.user is None:
             else:
                 st.error("Username already exists")
 
+    st.markdown("</div>", unsafe_allow_html=True)
     st.stop()
 
 # ================= MAIN APP =================
@@ -332,10 +335,11 @@ for hid, path, pred, conf, ts in history:
     if cols[0].button(f"{icon}{emoji} {name[:16]} · {ts.split()[0]}", key=f"sel_{hid}"):
         st.session_state.selected_id = hid
 
-    if cols[1].button("🗑️", key=f"del_{hid}"):
-        delete_history_item(hid)
-        st.session_state.selected_id = None
-        st.rerun()
+    with cols[1]:
+        if st.button("🗑️", key=f"del_{hid}"):
+            delete_history_item(hid)
+            st.session_state.selected_id = None
+            st.rerun()
 
 st.sidebar.markdown("---")
 
@@ -347,11 +351,15 @@ if history and st.sidebar.button("🗑️ Delete ALL"):
 st.title("🕵️ Deepfake Detection Assistant")
 st.caption("Upload an image or video to check if it's real or AI-generated/manipulated.")
 
+# -------- UPLOAD CARD --------
+st.markdown("<div class='card fade-in'>", unsafe_allow_html=True)
 uploaded_file = st.file_uploader(
     "Upload image or video",
     IMAGE_TYPES + VIDEO_TYPES
 )
+st.markdown("</div>", unsafe_allow_html=True)
 
+# -------- PROCESS --------
 if uploaded_file:
     data = uploaded_file.getvalue()
     h = file_hash(data)
