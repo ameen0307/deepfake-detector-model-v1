@@ -78,8 +78,10 @@ def login_user(username, password):
 # ================= MODEL =================
 @st.cache_resource
 def load_model():
-    processor = AutoImageProcessor.from_pretrained(MODEL_ID)
-    model = AutoModelForImageClassification.from_pretrained(MODEL_ID)
+    processor = AutoImageProcessor.from_pretrained(MODEL_ID, use_fast=False)
+    model = AutoModelForImageClassification.from_pretrained(
+        MODEL_ID, torch_dtype=torch.float32
+    )
     model.eval()
     return processor, model
 
@@ -87,23 +89,23 @@ def load_model():
 def file_hash(data: bytes):
     return hashlib.md5(data).hexdigest()
 
-def frame_sharpness(gray: np.ndarray) -> float:
+def frame_sharpness(gray):
     return cv2.Laplacian(gray, cv2.CV_64F).var()
 
-def frame_brightness(gray: np.ndarray) -> float:
+def frame_brightness(gray):
     return gray.mean()
 
-def apply_temperature(logits: torch.Tensor, temperature: float = TEMPERATURE):
+def apply_temperature(logits, temperature=TEMPERATURE):
     return torch.softmax(logits / temperature, dim=1)
 
-def sample_frame_indices(total_frames: int, n: int):
+def sample_frame_indices(total_frames, n):
     if total_frames <= n:
         return list(range(total_frames))
     step = total_frames / n
     return [int(i * step) for i in range(n)]
 
 # ================= IMAGE CLASSIFICATION =================
-def classify_image_tta(image: Image.Image):
+def classify_image_tta(image):
     processor, model = load_model()
 
     variants = [
@@ -123,22 +125,19 @@ def classify_image_tta(image: Image.Image):
     avg_logits = torch.stack(all_logits).mean(dim=0)
     probs = apply_temperature(avg_logits)[0]
 
-    # Correct label mapping for this model
-    real_prob = probs[0].item()
-    fake_prob = probs[1].item()
-
-    confidence = max(real_prob, fake_prob)
+    fake, real = probs[0].item(), probs[1].item()
+    confidence = max(fake, real)
 
     if confidence < UNCERTAINTY_THRESHOLD:
         label = "UNCERTAIN"
-    elif fake_prob > real_prob:
+    elif fake > real:
         label = "FAKE"
     else:
         label = "REAL"
 
     return label, confidence, fake
 
-def classify_image(image: Image.Image):
+def classify_image(image):
     label, confidence, _ = classify_image_tta(image)
     return label, confidence
 
@@ -207,7 +206,6 @@ def classify_video(video_path):
 def save_history(username, filepath, prediction, confidence):
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-
     try:
         c.execute("""
             INSERT INTO history (username, filepath, prediction, confidence, timestamp)
@@ -241,29 +239,25 @@ def delete_history_item(history_id):
     c = conn.cursor()
     c.execute("SELECT filepath FROM history WHERE id=?", (history_id,))
     row = c.fetchone()
-
     if row:
         if os.path.exists(row[0]):
             os.remove(row[0])
         c.execute("DELETE FROM history WHERE id=?", (history_id,))
         conn.commit()
-
     conn.close()
 
 def delete_all_history(username):
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute("SELECT filepath FROM history WHERE username=?", (username,))
-
     for (path,) in c.fetchall():
         if os.path.exists(path):
             os.remove(path)
-
     c.execute("DELETE FROM history WHERE username=?", (username,))
     conn.commit()
     conn.close()
 
-# ================= UI STYLING =================
+# ================= SESSION =================
 st.set_page_config("Deepfake Detector", "🕵️", layout="wide")
 
 for key, default in [
@@ -276,7 +270,6 @@ for key, default in [
 
 # ================= LOGIN =================
 if st.session_state.user is None:
-    st.markdown("<div class='fade-in'>", unsafe_allow_html=True)
     st.title("🔐 Login / Register")
     tab1, tab2 = st.tabs(["Login", "Register"])
 
@@ -299,7 +292,6 @@ if st.session_state.user is None:
             else:
                 st.error("Username already exists")
 
-    st.markdown("</div>", unsafe_allow_html=True)
     st.stop()
 
 # ================= MAIN APP =================
@@ -310,6 +302,7 @@ os.makedirs(user_dir, exist_ok=True)
 IMAGE_TYPES = ["jpg", "jpeg", "png", "webp"]
 VIDEO_TYPES = ["mp4", "mov", "avi", "mkv"]
 
+# -------- SIDEBAR --------
 st.sidebar.title("📁 History")
 
 if st.sidebar.button("🚪 Logout"):
@@ -335,11 +328,10 @@ for hid, path, pred, conf, ts in history:
     if cols[0].button(f"{icon}{emoji} {name[:16]} · {ts.split()[0]}", key=f"sel_{hid}"):
         st.session_state.selected_id = hid
 
-    with cols[1]:
-        if st.button("🗑️", key=f"del_{hid}"):
-            delete_history_item(hid)
-            st.session_state.selected_id = None
-            st.rerun()
+    if cols[1].button("🗑️", key=f"del_{hid}"):
+        delete_history_item(hid)
+        st.session_state.selected_id = None
+        st.rerun()
 
 st.sidebar.markdown("---")
 
@@ -348,23 +340,30 @@ if history and st.sidebar.button("🗑️ Delete ALL"):
     st.session_state.selected_id = None
     st.rerun()
 
+# -------- UPLOAD --------
 st.title("🕵️ Deepfake Detection Assistant")
-st.caption("Upload an image or video to check if it's real or AI-generated/manipulated.")
+st.caption("Upload images/videos or select entire folder (Ctrl+A then drag).")
 
-# -------- UPLOAD CARD --------
-st.markdown("<div class='card fade-in'>", unsafe_allow_html=True)
-uploaded_file = st.file_uploader(
-    "Upload image or video",
-    IMAGE_TYPES + VIDEO_TYPES
+uploaded_files = st.file_uploader(
+    "Upload image(s) or video(s)",
+    type=IMAGE_TYPES + VIDEO_TYPES,
+    accept_multiple_files=True
 )
-st.markdown("</div>", unsafe_allow_html=True)
 
-# -------- PROCESS --------
-if uploaded_file:
-    data = uploaded_file.getvalue()
-    h = file_hash(data)
+if uploaded_files:
+    progress_bar = st.progress(0)
+    status_text = st.empty()
 
-    if h not in st.session_state.processed_hashes:
+    total_files = len(uploaded_files)
+    processed_count = 0
+
+    for uploaded_file in uploaded_files:
+        data = uploaded_file.getvalue()
+        h = file_hash(data)
+
+        if h in st.session_state.processed_hashes:
+            continue
+
         filename = f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uploaded_file.name}"
         filepath = os.path.join(user_dir, filename)
 
@@ -372,20 +371,26 @@ if uploaded_file:
             f.write(data)
 
         ext = uploaded_file.name.lower().rsplit(".", 1)[-1]
+        status_text.text(f"Analyzing {uploaded_file.name}...")
 
-        with st.spinner("🔍 Analyzing... this may take a moment for videos."):
-            if ext in IMAGE_TYPES:
-                image = Image.open(filepath).convert("RGB")
-                label, confidence = classify_image(image)
-            else:
-                label, confidence = classify_video(filepath)
+        if ext in IMAGE_TYPES:
+            image = Image.open(filepath).convert("RGB")
+            label, confidence = classify_image(image)
+        else:
+            label, confidence = classify_video(filepath)
 
         save_history(username, filepath, label, confidence)
 
         st.session_state.processed_hashes.add(h)
-        st.session_state.selected_id = None
-        st.rerun()
 
+        processed_count += 1
+        progress_bar.progress(processed_count / total_files)
+
+    status_text.text("✅ All files analyzed successfully!")
+    st.success(f"Processed {processed_count} files.")
+    st.rerun()
+
+# -------- DISPLAY --------
 if st.session_state.selected_id:
     for hid, path, pred, conf, ts in history:
         if hid != st.session_state.selected_id:
@@ -406,20 +411,18 @@ if st.session_state.selected_id:
         with col2:
             st.markdown("### Detection Result")
 
-            conf = float(conf) if conf else 0.0
-
             if pred == "REAL":
-                st.success(f"🟢 REAL — {conf:.2%} confidence")
+                st.success(f"🟢 REAL — {float(conf):.2%} confidence")
             elif pred == "FAKE":
-                st.error(f"🔴 FAKE — {conf:.2%} confidence")
+                st.error(f"🔴 FAKE — {float(conf):.2%} confidence")
             else:
-                st.warning(f"🟡 UNCERTAIN — {conf:.2%} confidence")
+                st.warning(f"🟡 UNCERTAIN — {float(conf):.2%} confidence")
 
-            st.progress(min(conf, 1.0))
+            st.progress(min(float(conf), 1.0))
             st.caption(f"🕐 Analyzed at: {ts}")
             st.caption(f"📄 File: {os.path.basename(path)}")
 
         break
 
-elif not uploaded_file:
-    st.info("👆 Upload a file above, or select a past result from the sidebar.")
+elif not uploaded_files:
+    st.info("👆 Upload files above, or select a past result from the sidebar.")
